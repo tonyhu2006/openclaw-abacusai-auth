@@ -1,5 +1,5 @@
 {
-  "id": "abacusai-auth",
+  "id": "openclaw-abacusai-auth",
   "providers": ["abacusai"],
   "configSchema": {
     "type": "object",

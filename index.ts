@@ -604,7 +604,7 @@ interface PluginAuthContext {
 }
 
 const abacusaiPlugin = {
-  id: "abacusai-auth",
+  id: "openclaw-abacusai-auth",
   name: "AbacusAI Auth",
   description: "AbacusAI RouteLLM provider plugin with direct connection and schema normalization",
   configSchema: emptyPluginConfigSchema(),
