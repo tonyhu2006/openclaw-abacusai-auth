@@ -1,6 +1,6 @@
 {
   "name": "openclaw-abacusai-auth",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "OpenClaw AbacusAI provider plugin - Third-party plugin for AbacusAI RouteLLM integration",
   "type": "module",
   "main": "index.ts",

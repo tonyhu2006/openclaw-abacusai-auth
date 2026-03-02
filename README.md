@@ -87,7 +87,7 @@ openclaw send "Hello" --model abacusai/gemini-3-flash-preview
                │
                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  Local Proxy (http://127.0.0.1:18790)                            │
+│  Local Proxy (http://127.0.0.1:<dynamic-port>)                   │
 │                                                                  │
 │  Schema Normalization:                                           │
 │  1. Removes `strict` field from tool definitions                 │
@@ -103,6 +103,9 @@ openclaw send "Hello" --model abacusai/gemini-3-flash-preview
 │  Routes to Claude, Gemini, GPT, DeepSeek, Llama, etc.           │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+**Security:** The local proxy uses a dynamic port assigned by the OS at startup,
+avoiding port conflicts and improving security.
 
 **Why a local proxy?** AbacusAI's RouteLLM is _mostly_ OpenAI-compatible but has
 strict schema requirements that OpenClaw's default tool schemas don't meet:
@@ -190,7 +193,7 @@ The plugin configures the AbacusAI provider to use the local proxy:
 
 ```json
 {
-  "baseUrl": "http://127.0.0.1:18790",
+  "baseUrl": "http://127.0.0.1:<dynamic-port>",
   "api": "openai-completions",
   "auth": "token",
   "compat": {
@@ -200,8 +203,9 @@ The plugin configures the AbacusAI provider to use the local proxy:
 }
 ```
 
-The local proxy automatically starts when the plugin loads and handles all
-schema normalization before forwarding requests to `https://routellm.abacus.ai/v1`.
+The local proxy automatically starts when the plugin loads with a dynamic port
+assigned by the OS, and handles all schema normalization before forwarding
+requests to `https://routellm.abacus.ai/v1`.
 
 ---
 
@@ -214,7 +218,7 @@ After login, the plugin writes the following to `~/.openclaw/openclaw.json`:
   "models": {
     "providers": {
       "abacusai": {
-        "baseUrl": "http://127.0.0.1:18790",
+        "baseUrl": "http://127.0.0.1:<dynamic-port>",
         "api": "openai-completions",
         "auth": "token",
         "compat": {

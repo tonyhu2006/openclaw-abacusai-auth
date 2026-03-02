@@ -14,8 +14,9 @@ const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 8192;
 
 // Proxy configuration
-const PROXY_PORT = 18790;
 const PROXY_HOST = "127.0.0.1";
+// Dynamic port - will be assigned when proxy starts
+let proxyPort = 0;
 
 // Models available on AbacusAI RouteLLM endpoint (OpenAI-compatible, with
 // function calling support). Verified 2026-02.
@@ -539,18 +540,17 @@ function startProxy(apiKey: string): Promise<void> {
         sendJsonResponse(res, 500, { error: { message: String(err) } });
       });
     });
-    proxyServer.listen(PROXY_PORT, PROXY_HOST, () => {
-      console.log(`[abacusai] proxy listening on http://${PROXY_HOST}:${PROXY_PORT}`);
+    // Use port 0 to let the OS assign a random available port
+    proxyServer.listen(0, PROXY_HOST, () => {
+      const addr = proxyServer?.address();
+      if (addr && typeof addr === "object") {
+        proxyPort = addr.port;
+      }
+      console.log(`[abacusai] proxy listening on http://${PROXY_HOST}:${proxyPort}`);
       resolve();
     });
     proxyServer.on("error", (err: NodeJS.ErrnoException) => {
-      if (err.code === "EADDRINUSE") {
-        // Port already in use, assume proxy is already running
-        proxyServer = null;
-        resolve();
-      } else {
-        reject(err);
-      }
+      reject(err);
     });
   });
 }
@@ -746,7 +746,7 @@ const abacusaiPlugin = {
                         // Use local proxy for schema normalization
                         // The proxy handles: removing `strict`, `patternProperties`,
                         // and adding `additionalProperties: false`
-                        baseUrl: `http://${PROXY_HOST}:${PROXY_PORT}`,
+                        baseUrl: `http://${PROXY_HOST}:${proxyPort}`,
                         api: "openai-completions",
                         auth: "token",
                         models: modelIds.map((id) => buildModelDefinition(id)),
@@ -768,7 +768,7 @@ const abacusaiPlugin = {
                 defaultModel: defaultModelRef,
                 notes: [
                   "Local proxy mode: schema normalization handled by plugin proxy.",
-                  "Proxy runs at http://127.0.0.1:18790 and forwards to RouteLLM.",
+                  "Proxy uses dynamic port and forwards to RouteLLM.",
                   "Full OpenAI function-calling support is enabled.",
                   "Manage your API keys at https://abacus.ai/app/profile/apikey",
                 ],
