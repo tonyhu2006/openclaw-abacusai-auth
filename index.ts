@@ -310,20 +310,105 @@ function normalizeSseChunk(line: string, chunkId: string): string {
 }
 
 /**
- * Strip `strict` field from tools - RouteLLM doesn't support it
+ * Keywords not supported by AbacusAI RouteLLM that must be removed from schemas
  */
-function stripStrictFromTools(tools: unknown[]): unknown[] {
+const UNSUPPORTED_SCHEMA_KEYWORDS = [
+  "patternProperties",
+  "$schema",
+  "$id",
+  "$ref",
+  "$defs",
+  "definitions",
+  "if",
+  "then",
+  "else",
+  "allOf",
+  "anyOf",
+  "oneOf",
+  "not",
+  "contentMediaType",
+  "contentEncoding",
+  "examples",
+  "deprecated",
+  "readOnly",
+  "writeOnly",
+  "$comment",
+  "unevaluatedProperties",
+  "unevaluatedItems",
+  "dependentRequired",
+  "dependentSchemas",
+  "propertyNames",
+  "contains",
+  "minContains",
+  "maxContains",
+  "prefixItems",
+];
+
+/**
+ * Recursively clean a JSON schema by removing unsupported keywords
+ * and ensuring additionalProperties: false is set
+ */
+function cleanSchema(schema: unknown): unknown {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return schema;
+  }
+
+  const obj = schema as Record<string, unknown>;
+  const cleaned: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(obj)) {
+    // Skip unsupported keywords
+    if (UNSUPPORTED_SCHEMA_KEYWORDS.includes(key)) {
+      continue;
+    }
+
+    // Recursively clean nested objects
+    if (key === "properties" && value && typeof value === "object") {
+      const props: Record<string, unknown> = {};
+      for (const [propKey, propValue] of Object.entries(value as Record<string, unknown>)) {
+        props[propKey] = cleanSchema(propValue);
+      }
+      cleaned[key] = props;
+    } else if (key === "items" && value && typeof value === "object") {
+      cleaned[key] = cleanSchema(value);
+    } else if (key === "additionalProperties" && value && typeof value === "object") {
+      cleaned[key] = cleanSchema(value);
+    } else {
+      cleaned[key] = value;
+    }
+  }
+
+  // Ensure additionalProperties: false for object types
+  if (obj.type === "object" && !("additionalProperties" in cleaned)) {
+    cleaned.additionalProperties = false;
+  }
+
+  return cleaned;
+}
+
+/**
+ * Strip `strict` field from tools and clean schemas - RouteLLM doesn't support them
+ */
+function normalizeToolsForRouteLLM(tools: unknown[]): unknown[] {
   return tools.map((t) => {
     if (!t || typeof t !== "object") {
       return t;
     }
     const copy = { ...(t as Record<string, unknown>) };
     delete copy.strict;
+
     if (copy.function && typeof copy.function === "object") {
       const fn = { ...(copy.function as Record<string, unknown>) };
       delete fn.strict;
+
+      // Clean the parameters schema
+      if (fn.parameters && typeof fn.parameters === "object") {
+        fn.parameters = cleanSchema(fn.parameters);
+      }
+
       copy.function = fn;
     }
+
     return copy;
   });
 }
@@ -340,9 +425,10 @@ async function handleProxyRequest(req: IncomingMessage, res: ServerResponse) {
   if (req.method === "POST") {
     const raw = await readBody(req);
     const parsed = JSON.parse(raw.toString()) as Record<string, unknown>;
-    // Strip `strict` field from tools - RouteLLM doesn't support it
+    // Normalize tools for RouteLLM: remove `strict` field, clean schemas
+    // (remove patternProperties, add additionalProperties: false, etc.)
     if (Array.isArray(parsed.tools)) {
-      parsed.tools = stripStrictFromTools(parsed.tools);
+      parsed.tools = normalizeToolsForRouteLLM(parsed.tools);
     }
     body = JSON.stringify(parsed);
   }
@@ -530,8 +616,17 @@ const abacusaiPlugin = {
       };
     };
 
-    // Direct connection mode - no proxy needed
-    // Core code handles schema cleaning via requiresCleanSchema compat option
+    // Use local proxy mode to handle schema cleaning internally
+    // This is required because OpenClaw core may not support requiresCleanSchema yet
+    // The proxy normalizes tool schemas before forwarding to RouteLLM
+
+    // Auto-start proxy if we have a saved API key
+    const savedKey = tryRecoverApiKey();
+    if (savedKey) {
+      startProxy(savedKey).catch((err) => {
+        console.error("[abacusai] Failed to auto-start proxy:", err);
+      });
+    }
 
     pluginApi.registerProvider({
       id: "abacusai",
@@ -614,6 +709,10 @@ const abacusaiPlugin = {
                 }
               }
 
+              // --- Start local proxy for schema normalization ---
+              spin.update("Starting local proxy for schema normalization…");
+              await startProxy(apiKey);
+
               // --- Model selection ---
               const modelInput = await ctx.prompter.text({
                 message: "Model IDs (comma-separated)",
@@ -644,14 +743,18 @@ const abacusaiPlugin = {
                   models: {
                     providers: {
                       abacusai: {
-                        baseUrl: ROUTELLM_BASE,
+                        // Use local proxy for schema normalization
+                        // The proxy handles: removing `strict`, `patternProperties`,
+                        // and adding `additionalProperties: false`
+                        baseUrl: `http://${PROXY_HOST}:${PROXY_PORT}`,
                         api: "openai-completions",
                         auth: "token",
                         models: modelIds.map((id) => buildModelDefinition(id)),
+                        // Note: compat options are kept for future OpenClaw core support
+                        // Currently, schema cleaning is done by the local proxy
                         compat: {
                           requiresAdditionalPropertiesFalse: true,
                           supportsStrictMode: false,
-                          requiresCleanSchema: true,
                         },
                       },
                     },
@@ -664,7 +767,8 @@ const abacusaiPlugin = {
                 },
                 defaultModel: defaultModelRef,
                 notes: [
-                  "Direct connection to AbacusAI RouteLLM with schema normalization.",
+                  "Local proxy mode: schema normalization handled by plugin proxy.",
+                  "Proxy runs at http://127.0.0.1:18790 and forwards to RouteLLM.",
                   "Full OpenAI function-calling support is enabled.",
                   "Manage your API keys at https://abacus.ai/app/profile/apikey",
                 ],

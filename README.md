@@ -87,13 +87,13 @@ openclaw send "Hello" --model abacusai/gemini-3-flash-preview
                │
                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  Core Tool Schema Normalization (pi-tools.schema.ts)             │
+│  Local Proxy (http://127.0.0.1:18790)                            │
 │                                                                  │
-│  1. Reads provider compat from config                            │
-│  2. If requiresAdditionalPropertiesFalse: true                   │
-│     → Sets additionalProperties: false in tool schemas           │
-│  3. If supportsStrictMode: false                                 │
-│     → pi-ai omits `strict` field from tool definitions           │
+│  Schema Normalization:                                           │
+│  1. Removes `strict` field from tool definitions                 │
+│  2. Removes unsupported keywords (patternProperties, $ref, etc.) │
+│  3. Adds `additionalProperties: false` to object schemas         │
+│  4. Normalizes SSE responses (adds missing id/object fields)     │
 └──────────────┬───────────────────────────────────────────────────┘
                │ https://routellm.abacus.ai/v1
                ▼
@@ -104,17 +104,15 @@ openclaw send "Hello" --model abacusai/gemini-3-flash-preview
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**Why core compat options instead of a local proxy?** AbacusAI's RouteLLM is
-_mostly_ OpenAI-compatible but has two schema requirements:
+**Why a local proxy?** AbacusAI's RouteLLM is _mostly_ OpenAI-compatible but has
+strict schema requirements that OpenClaw's default tool schemas don't meet:
 
-1. Rejects the `strict` field in tool schemas → `supportsStrictMode: false`
-2. Requires `additionalProperties: false` → `requiresAdditionalPropertiesFalse: true`
+1. Rejects the `strict` field in tool schemas
+2. Rejects `patternProperties` and other advanced JSON Schema keywords
+3. Requires `additionalProperties: false` in object schemas
 
-By using core `ModelCompatConfig` options, we:
-
-- Avoid the complexity of a local proxy
-- Enable the same fix for other providers with similar requirements
-- Let pi-ai handle the `strict` field natively (it already supports `supportsStrictMode`)
+The local proxy handles all schema normalization internally, making the plugin
+fully self-contained and compatible with any OpenClaw version
 
 ---
 
@@ -188,11 +186,11 @@ is set to `false`, the pi-ai library omits the `strict` field from tool definiti
 
 ### Provider Configuration
 
-The plugin configures the AbacusAI provider with these compat options:
+The plugin configures the AbacusAI provider to use the local proxy:
 
 ```json
 {
-  "baseUrl": "https://routellm.abacus.ai/v1",
+  "baseUrl": "http://127.0.0.1:18790",
   "api": "openai-completions",
   "auth": "token",
   "compat": {
@@ -201,6 +199,9 @@ The plugin configures the AbacusAI provider with these compat options:
   }
 }
 ```
+
+The local proxy automatically starts when the plugin loads and handles all
+schema normalization before forwarding requests to `https://routellm.abacus.ai/v1`.
 
 ---
 
@@ -213,7 +214,7 @@ After login, the plugin writes the following to `~/.openclaw/openclaw.json`:
   "models": {
     "providers": {
       "abacusai": {
-        "baseUrl": "https://routellm.abacus.ai/v1",
+        "baseUrl": "http://127.0.0.1:18790",
         "api": "openai-completions",
         "auth": "token",
         "compat": {
