@@ -290,7 +290,8 @@ function generateChunkId(): string {
 }
 
 /**
- * Normalize SSE chunk to add missing id and object fields
+ * Normalize SSE chunk to add missing id and object fields,
+ * and normalize any tool_calls in delta to standard OpenAI format.
  */
 function normalizeSseChunk(line: string, chunkId: string): string {
   if (!line.startsWith("data: ") || line === "data: [DONE]") {
@@ -303,6 +304,38 @@ function normalizeSseChunk(line: string, chunkId: string): string {
     }
     if (!("object" in json)) {
       json.object = "chat.completion.chunk";
+    }
+    // Normalize tool_calls in streaming delta
+    if (Array.isArray(json.choices)) {
+      json.choices = (json.choices as unknown[]).map((c) => {
+        if (!c || typeof c !== "object") return c;
+        const choice = c as Record<string, unknown>;
+        const delta = choice.delta;
+        if (delta && typeof delta === "object") {
+          const d = delta as Record<string, unknown>;
+          if (Array.isArray(d.tool_calls)) {
+            d.tool_calls = (d.tool_calls as unknown[]).map((tc) => {
+              if (!tc || typeof tc !== "object") return tc;
+              const call = tc as Record<string, unknown>;
+              // If flat format (name at top level, no function), convert
+              if (call.name && !call.function) {
+                const args = call.arguments ?? call.parameters ?? "";
+                return {
+                  index: call.index,
+                  id: call.id ?? call.call_id ?? `call_${crypto.randomUUID()}`,
+                  type: "function",
+                  function: {
+                    name: call.name,
+                    arguments: typeof args === "string" ? args : JSON.stringify(args),
+                  },
+                };
+              }
+              return call;
+            });
+          }
+        }
+        return choice;
+      });
     }
     return `data: ${JSON.stringify(json)}`;
   } catch {
@@ -414,6 +447,90 @@ function normalizeToolsForRouteLLM(tools: unknown[]): unknown[] {
   });
 }
 
+/**
+ * Normalize tool_calls in request messages for RouteLLM.
+ * RouteLLM expects `name` and `parameters` at the top level of each tool_call,
+ * but OpenClaw sends them nested under `function` (OpenAI standard format).
+ */
+function normalizeMessagesForRouteLLM(messages: unknown[]): unknown[] {
+  return messages.map((msg) => {
+    if (!msg || typeof msg !== "object") return msg;
+    const m = msg as Record<string, unknown>;
+    if (m.role !== "assistant" || !Array.isArray(m.tool_calls)) return msg;
+
+    const normalized = { ...m };
+    normalized.tool_calls = (m.tool_calls as unknown[]).map((tc) => {
+      if (!tc || typeof tc !== "object") return tc;
+      const call = { ...(tc as Record<string, unknown>) };
+
+      // Extract name from function.name if not already at top level
+      if (!call.name && call.function && typeof call.function === "object") {
+        const fn = call.function as Record<string, unknown>;
+        call.name = fn.name;
+      }
+
+      // Extract parameters from function.arguments if not already at top level
+      if (call.parameters === undefined && call.function && typeof call.function === "object") {
+        const fn = call.function as Record<string, unknown>;
+        const args = fn.arguments;
+        if (typeof args === "string") {
+          try { call.parameters = JSON.parse(args); } catch { call.parameters = args; }
+        } else if (args !== undefined) {
+          call.parameters = args;
+        }
+      }
+
+      return call;
+    });
+    return normalized;
+  });
+}
+
+/**
+ * Normalize a single tool_call from RouteLLM response to OpenAI standard format.
+ * RouteLLM may return tool_calls with flat `name`/`parameters` instead of nested `function`.
+ */
+function normalizeResponseToolCall(tc: Record<string, unknown>): Record<string, unknown> {
+  // Already in standard format
+  if (tc.function && typeof tc.function === "object") {
+    return tc;
+  }
+  // Flat format: { name, parameters/arguments } → { function: { name, arguments } }
+  if (tc.name) {
+    const args = tc.arguments ?? tc.parameters ?? "{}";
+    const argsStr = typeof args === "string" ? args : JSON.stringify(args);
+    return {
+      id: tc.id ?? tc.call_id ?? `call_${crypto.randomUUID()}`,
+      type: "function",
+      function: { name: tc.name, arguments: argsStr },
+    };
+  }
+  return tc;
+}
+
+/**
+ * Normalize tool_calls in a parsed response JSON (non-streaming).
+ */
+function normalizeResponseToolCalls(json: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(json.choices)) return json;
+  json.choices = (json.choices as unknown[]).map((c) => {
+    if (!c || typeof c !== "object") return c;
+    const choice = { ...(c as Record<string, unknown>) };
+    const message = choice.message;
+    if (message && typeof message === "object") {
+      const msg = { ...(message as Record<string, unknown>) };
+      if (Array.isArray(msg.tool_calls)) {
+        msg.tool_calls = (msg.tool_calls as unknown[]).map((tc) =>
+          tc && typeof tc === "object" ? normalizeResponseToolCall(tc as Record<string, unknown>) : tc
+        );
+      }
+      choice.message = msg;
+    }
+    return choice;
+  });
+  return json;
+}
+
 async function handleProxyRequest(req: IncomingMessage, res: ServerResponse) {
   const path = req.url ?? "/";
   const target = `${ROUTELLM_BASE}${path}`;
@@ -430,6 +547,10 @@ async function handleProxyRequest(req: IncomingMessage, res: ServerResponse) {
     // (remove patternProperties, add additionalProperties: false, etc.)
     if (Array.isArray(parsed.tools)) {
       parsed.tools = normalizeToolsForRouteLLM(parsed.tools);
+    }
+    // Normalize tool_calls in messages: add top-level name/parameters for RouteLLM
+    if (Array.isArray(parsed.messages)) {
+      parsed.messages = normalizeMessagesForRouteLLM(parsed.messages);
     }
     body = JSON.stringify(parsed);
   }
@@ -476,7 +597,7 @@ async function handleProxyRequest(req: IncomingMessage, res: ServerResponse) {
     let buffer = "";
 
     const pump = async () => {
-      for (;;) {
+      for (; ;) {
         const { done, value } = await reader.read();
         if (done) {
           // Process any remaining buffer
@@ -506,17 +627,19 @@ async function handleProxyRequest(req: IncomingMessage, res: ServerResponse) {
       await release();
     });
   } else {
-    // Non-streaming response - add id and object fields
+    // Non-streaming response - add id and object fields, normalize tool_calls
     const data = await upstream.text();
     await release();
     try {
-      const json = JSON.parse(data) as Record<string, unknown>;
+      let json = JSON.parse(data) as Record<string, unknown>;
       if (!("id" in json)) {
         json.id = chunkId;
       }
       if (!("object" in json)) {
         json.object = "chat.completion";
       }
+      // Normalize tool_calls to standard OpenAI format
+      json = normalizeResponseToolCalls(json);
       res.writeHead(upstream.status, { "Content-Type": "application/json" });
       res.end(JSON.stringify(json));
     } catch {
@@ -604,7 +727,7 @@ interface PluginAuthContext {
 }
 
 const abacusaiPlugin = {
-  id: "openclaw-abacusai-auth",
+  id: "abacusai-auth",
   name: "AbacusAI Auth",
   description: "AbacusAI RouteLLM provider plugin with direct connection and schema normalization",
   configSchema: emptyPluginConfigSchema(),
@@ -750,12 +873,6 @@ const abacusaiPlugin = {
                         api: "openai-completions",
                         auth: "token",
                         models: modelIds.map((id) => buildModelDefinition(id)),
-                        // Note: compat options are kept for future OpenClaw core support
-                        // Currently, schema cleaning is done by the local proxy
-                        compat: {
-                          requiresAdditionalPropertiesFalse: true,
-                          supportsStrictMode: false,
-                        },
                       },
                     },
                   },

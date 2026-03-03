@@ -1,6 +1,8 @@
 {
-  "id": "openclaw-abacusai-auth",
-  "providers": ["abacusai"],
+  "id": "abacusai-auth",
+  "providers": [
+    "abacusai"
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
