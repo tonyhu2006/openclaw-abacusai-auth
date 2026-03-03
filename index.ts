@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -721,6 +721,48 @@ function buildModelDefinition(modelId: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Dynamic baseUrl updater — keep config in sync with current proxy port
+// ---------------------------------------------------------------------------
+
+/**
+ * Update the `models.providers.abacusai.baseUrl` in openclaw.json to match
+ * the current proxy port. This is necessary because the proxy uses port 0
+ * (OS-assigned random port) and gets a new port every time the gateway starts,
+ * but the config still stores the port from when `openclaw models auth login`
+ * was first run.
+ */
+function updateBaseUrlInConfig(): void {
+  if (!proxyPort) return;
+  const newBaseUrl = `http://${PROXY_HOST}:${proxyPort}`;
+  try {
+    const stateDir =
+      process.env.OPENCLAW_STATE_DIR ||
+      process.env.CLAWDBOT_STATE_DIR ||
+      join(homedir(), ".openclaw");
+    const configPath = join(stateDir, "openclaw.json");
+    if (!existsSync(configPath)) return;
+
+    const raw = readFileSync(configPath, "utf-8");
+    const config = JSON.parse(raw);
+    const currentUrl = config?.models?.providers?.abacusai?.baseUrl;
+
+    if (currentUrl === newBaseUrl) {
+      // Already up to date
+      return;
+    }
+
+    // Update the baseUrl
+    if (config.models?.providers?.abacusai) {
+      config.models.providers.abacusai.baseUrl = newBaseUrl;
+      writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+      console.log(`[abacusai] Updated config baseUrl: ${currentUrl} → ${newBaseUrl}`);
+    }
+  } catch (err) {
+    console.error("[abacusai] Failed to update baseUrl in config:", err);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
@@ -760,9 +802,16 @@ const abacusaiPlugin = {
     // Auto-start proxy if we have a saved API key
     const savedKey = tryRecoverApiKey();
     if (savedKey) {
-      startProxy(savedKey).catch((err) => {
-        console.error("[abacusai] Failed to auto-start proxy:", err);
-      });
+      startProxy(savedKey)
+        .then(() => {
+          // Update baseUrl in config to match the new proxy port
+          // (The proxy gets a new random port each time the gateway starts,
+          // but the config still has the port from when auth was first run)
+          updateBaseUrlInConfig();
+        })
+        .catch((err) => {
+          console.error("[abacusai] Failed to auto-start proxy:", err);
+        });
     }
 
     pluginApi.registerProvider({
