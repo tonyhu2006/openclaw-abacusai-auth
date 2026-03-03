@@ -421,7 +421,10 @@ function cleanSchema(schema: unknown): unknown {
 }
 
 /**
- * Strip `strict` field from tools and clean schemas - RouteLLM doesn't support them
+ * Strip `strict` field from tools, clean schemas, and promote name/parameters
+ * to the top level of each tool object for RouteLLM compatibility.
+ * RouteLLM expects `name` and `parameters` accessible at the tool level,
+ * not only nested under `function`.
  */
 function normalizeToolsForRouteLLM(tools: unknown[]): unknown[] {
   return tools.map((t) => {
@@ -441,6 +444,17 @@ function normalizeToolsForRouteLLM(tools: unknown[]): unknown[] {
       }
 
       copy.function = fn;
+
+      // Promote name and parameters to top level for RouteLLM
+      if (fn.name && !copy.name) {
+        copy.name = fn.name;
+      }
+      if (fn.parameters !== undefined && copy.parameters === undefined) {
+        copy.parameters = fn.parameters;
+      }
+      if (fn.description && !copy.description) {
+        copy.description = fn.description;
+      }
     }
 
     return copy;
