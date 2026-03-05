@@ -814,7 +814,7 @@ function buildModelDefinition(modelId: string) {
  * but the config still stores the port from when `openclaw models auth login`
  * was first run.
  */
-function updateBaseUrlInConfig(): void {
+function updateBaseUrlInConfig(pluginApi: any): void {
   if (!proxyPort) return;
   const newBaseUrl = `http://${PROXY_HOST}:${proxyPort}`;
   try {
@@ -823,24 +823,30 @@ function updateBaseUrlInConfig(): void {
       process.env.CLAWDBOT_STATE_DIR ||
       join(homedir(), ".openclaw");
     const configPath = join(stateDir, "openclaw.json");
-    if (!existsSync(configPath)) return;
 
-    let raw = readFileSync(configPath, "utf-8");
-    // Strip UTF-8 BOM if present
-    if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
-    const config = JSON.parse(raw);
-    const currentUrl = config?.models?.providers?.abacusai?.baseUrl;
-
-    if (currentUrl === newBaseUrl) {
-      // Already up to date
-      return;
+    // 1. Update in-memory OpenClaw config if available (so it works immediately and saves correctly)
+    let inMemoryUpdated = false;
+    if (pluginApi?.config?.models?.providers?.abacusai) {
+      if (pluginApi.config.models.providers.abacusai.baseUrl !== newBaseUrl) {
+        pluginApi.config.models.providers.abacusai.baseUrl = newBaseUrl;
+        inMemoryUpdated = true;
+      }
     }
 
-    // Update the baseUrl
-    if (config.models?.providers?.abacusai) {
-      config.models.providers.abacusai.baseUrl = newBaseUrl;
-      writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
-      console.log(`[abacusai] Updated config baseUrl: ${currentUrl} → ${newBaseUrl}`);
+    // 2. Fallback to writing the disk file directly if needed
+    if (existsSync(configPath)) {
+      let raw = readFileSync(configPath, "utf-8");
+      if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+      const config = JSON.parse(raw);
+      const currentUrl = config?.models?.providers?.abacusai?.baseUrl;
+
+      if (currentUrl !== newBaseUrl && config.models?.providers?.abacusai) {
+        config.models.providers.abacusai.baseUrl = newBaseUrl;
+        writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+        console.log(`[abacusai] Updated config baseUrl on disk: ${currentUrl} → ${newBaseUrl}`);
+      } else if (inMemoryUpdated) {
+        console.log(`[abacusai] Updated in-memory baseUrl to ${newBaseUrl}`);
+      }
     }
   } catch (err) {
     console.error("[abacusai] Failed to update baseUrl in config:", err);
@@ -913,7 +919,7 @@ const abacusaiPlugin = {
           // Update baseUrl in config to match the new proxy port
           // (The proxy gets a new random port each time the gateway starts,
           // but the config still has the port from when auth was first run)
-          updateBaseUrlInConfig();
+          updateBaseUrlInConfig(pluginApi);
         })
         .catch((err) => {
           console.error("[abacusai] Failed to auto-start proxy:", err);
