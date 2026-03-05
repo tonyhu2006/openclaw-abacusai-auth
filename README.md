@@ -298,6 +298,14 @@ If AbacusAI models are not available, ensure the plugin is installed:
 openclaw plugins install openclaw-abacusai-auth
 ```
 
+### Webchat no response (Zombie Proxy)
+
+If you send messages in Webchat and receive no response, the Gateway may be attempting to communicate with a stale proxy port. This occurs when OpenClaw's internal `openclaw.json` registers `18862`, but a zombie plugin process from a previous run is holding `18862`, forcing the new plugin to dynamically increment its port to `18863` or higher. The Gateway sends requests to `18862` (the zombie proxy, which doesn't know how to route current requests), resulting in hanging chats.
+
+**Solution (v1.2.8+)**:
+The plugin now implements a self-healing `/__kill` HTTP endpoint. If the plugin detects `EADDRINUSE` during startup on `18862`, it aggressively kills the legacy zombie proxy holding the port, waits 1 second, and successfully binds to `18862`. You should no longer experience Webchat unresponsiveness due to port drifting. 
+If it ever hangs, simply restart your Gateway using standard `Ctrl+C` or `openclaw gateway stop` to ensure the hook securely cleans up the process.
+
 ---
 
 ## Getting an API Key
