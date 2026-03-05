@@ -270,6 +270,8 @@ async function validateApiKey(
 
 let proxyServer: ReturnType<typeof createServer> | null = null;
 let proxyApiKey = "";
+let activeProxyRequests = 0;
+let proxyShuttingDown = false;
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -554,6 +556,19 @@ function normalizeResponseToolCalls(json: Record<string, unknown>): Record<strin
 }
 
 async function handleProxyRequest(req: IncomingMessage, res: ServerResponse) {
+  if (proxyShuttingDown) {
+    sendJsonResponse(res, 503, { error: { message: "Proxy is shutting down", type: "service_unavailable" } });
+    return;
+  }
+  activeProxyRequests++;
+  try {
+    await handleProxyRequestInner(req, res);
+  } finally {
+    activeProxyRequests--;
+  }
+}
+
+async function handleProxyRequestInner(req: IncomingMessage, res: ServerResponse) {
   const path = req.url ?? "/";
   const target = `${ROUTELLM_BASE}${path}`;
   const headers: Record<string, string> = {
@@ -718,6 +733,48 @@ function startProxy(apiKey: string): Promise<void> {
   });
 }
 
+/**
+ * Gracefully stop the RouteLLM proxy server.
+ * 1. Stop accepting new connections
+ * 2. Wait for all in-flight requests to complete (up to 10s timeout)
+ * 3. Close the server and release the port
+ */
+function stopProxy(): Promise<void> {
+  return new Promise((resolve) => {
+    if (!proxyServer) {
+      resolve();
+      return;
+    }
+
+    proxyShuttingDown = true;
+    console.log(`[abacusai] Proxy shutting down (${activeProxyRequests} active requests)...`);
+
+    // Stop accepting new connections immediately
+    proxyServer.close(() => {
+      console.log("[abacusai] Proxy server closed, port released.");
+      proxyServer = null;
+      proxyShuttingDown = false;
+      activeProxyRequests = 0;
+      resolve();
+    });
+
+    // Force-close after 10s if requests don't drain
+    const forceTimeout = setTimeout(() => {
+      console.warn(`[abacusai] Force-closing proxy (${activeProxyRequests} requests still active after 10s).`);
+      proxyServer?.closeAllConnections?.();
+    }, 10_000);
+
+    // Poll for active requests to finish, resolve early if all done
+    const drainInterval = setInterval(() => {
+      if (activeProxyRequests <= 0) {
+        clearInterval(drainInterval);
+        clearTimeout(forceTimeout);
+        // server.close callback will resolve
+      }
+    }, 200);
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -818,10 +875,31 @@ const abacusaiPlugin = {
   register(api: unknown) {
     const pluginApi = api as {
       registerProvider: (config: unknown) => void;
+      registerHook?: (events: string | string[], handler: Function, opts?: { name?: string }) => void;
       config?: {
         models?: { providers?: { abacusai?: { compat?: { supportsStrictMode?: boolean } } } };
       };
     };
+
+    // ================================================================
+    // Register gateway_stop hook for graceful proxy shutdown
+    // ================================================================
+    if (typeof pluginApi.registerHook === "function") {
+      pluginApi.registerHook(
+        "gateway_stop",
+        async () => {
+          await stopProxy();
+        },
+        { name: "openclaw-abacusai-auth:gateway-stop" },
+      );
+    }
+
+    // Fallback: handle process signals if gateway_stop hook is unavailable
+    const shutdownHandler = () => {
+      stopProxy().then(() => process.exit(0));
+    };
+    process.once("SIGTERM", shutdownHandler);
+    process.once("SIGINT", shutdownHandler);
 
     // Use local proxy mode to handle schema cleaning internally
     // This is required because OpenClaw core may not support requiresCleanSchema yet
