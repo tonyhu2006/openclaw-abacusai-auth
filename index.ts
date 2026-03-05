@@ -570,6 +570,17 @@ async function handleProxyRequest(req: IncomingMessage, res: ServerResponse) {
 
 async function handleProxyRequestInner(req: IncomingMessage, res: ServerResponse) {
   const path = req.url ?? "/";
+
+  if (path === "/__kill") {
+    console.log("[abacusai] Received /__kill command, stopping zombie proxy...");
+    sendJsonResponse(res, 200, { success: true });
+    // Execute stop proxy asynchronously after sending response
+    setTimeout(() => {
+      stopProxy().catch(() => process.exit(0));
+    }, 100);
+    return;
+  }
+
   const target = `${ROUTELLM_BASE}${path}`;
   const headers: Record<string, string> = {
     Authorization: `Bearer ${proxyApiKey}`,
@@ -703,33 +714,50 @@ function startProxy(apiKey: string): Promise<void> {
       });
     });
 
-    // Try fixed port first, then retry with port+1, +2, etc.
-    const tryListen = (port: number, attempt: number) => {
+    let killAttempts = 0;
+    const tryListen = (port: number) => {
       proxyServer!.listen(port, PROXY_HOST, () => {
         proxyPort = port;
         console.log(`[abacusai] proxy listening on http://${PROXY_HOST}:${proxyPort}`);
         resolve();
       });
       proxyServer!.once("error", (err: NodeJS.ErrnoException) => {
-        if (err.code === "EADDRINUSE" && attempt < 10) {
-          console.log(`[abacusai] port ${port} in use, trying ${port + 1}...`);
+        if (err.code === "EADDRINUSE") {
+          console.log(`[abacusai] port ${port} in use. Attempting to kill zombie proxy...`);
+          killAttempts++;
+          if (killAttempts > 5) {
+            console.error("[abacusai] Could not kill zombie proxy after multiple attempts.");
+            reject(new Error("EADDRINUSE on port 18862 and cannot kill zombie proxy."));
+            return;
+          }
           proxyServer!.removeAllListeners("error");
-          proxyServer!.close(() => {
+
+          // Try to kill the zombie proxy by sending it the /__kill command
+          const { request } = require("node:http");
+          const req = request(`http://${PROXY_HOST}:${port}/__kill`, { method: 'GET' }, (res: IncomingMessage) => {
+            res.resume();
+          });
+          req.on('error', () => { }); // Ignore network errors
+          req.end();
+
+          console.log(`[abacusai] Waiting 1s for port ${port} to free up...`);
+          setTimeout(() => {
+            // Create fresh proxyServer to avoid closed state issues
             proxyServer = createServer((req, res) => {
               handleProxyRequest(req, res).catch((e) => {
                 console.error("[abacusai] proxy error:", e);
                 sendJsonResponse(res, 500, { error: { message: String(e) } });
               });
             });
-            tryListen(port + 1, attempt + 1);
-          });
+            tryListen(port);
+          }, 1000);
         } else {
           reject(err);
         }
       });
     };
 
-    tryListen(PROXY_PORT_DEFAULT, 0);
+    tryListen(PROXY_PORT_DEFAULT);
   });
 }
 
