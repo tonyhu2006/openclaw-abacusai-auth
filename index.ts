@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+﻿import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -15,8 +15,9 @@ const DEFAULT_MAX_TOKENS = 8192;
 
 // Proxy configuration
 const PROXY_HOST = "127.0.0.1";
-// Dynamic port - will be assigned when proxy starts
-let proxyPort = 0;
+// Fixed port for the proxy so the baseUrl saved at auth time always works
+const PROXY_PORT_DEFAULT = 18862;
+let proxyPort = PROXY_PORT_DEFAULT;
 
 // Models available on AbacusAI RouteLLM endpoint (OpenAI-compatible, with
 // function calling support). Verified 2026-02.
@@ -443,6 +444,13 @@ function normalizeToolsForRouteLLM(tools: unknown[]): unknown[] {
         fn.parameters = cleanSchema(fn.parameters);
       }
 
+      // RouteLLM REQUIRES every tool to have a `parameters` field.
+      // If a tool has no parameters (e.g. cognitive_assess, flare_plan),
+      // add a default empty object schema.
+      if (!fn.parameters) {
+        fn.parameters = { type: "object", properties: {} };
+      }
+
       copy.function = fn;
 
       // Promote name and parameters to top level for RouteLLM
@@ -559,6 +567,8 @@ async function handleProxyRequest(req: IncomingMessage, res: ServerResponse) {
     const parsed = JSON.parse(raw.toString()) as Record<string, unknown>;
     // Normalize tools for RouteLLM: remove `strict` field, clean schemas
     // (remove patternProperties, add additionalProperties: false, etc.)
+
+
     if (Array.isArray(parsed.tools)) {
       parsed.tools = normalizeToolsForRouteLLM(parsed.tools);
     }
@@ -677,18 +687,34 @@ function startProxy(apiKey: string): Promise<void> {
         sendJsonResponse(res, 500, { error: { message: String(err) } });
       });
     });
-    // Use port 0 to let the OS assign a random available port
-    proxyServer.listen(0, PROXY_HOST, () => {
-      const addr = proxyServer?.address();
-      if (addr && typeof addr === "object") {
-        proxyPort = addr.port;
-      }
-      console.log(`[abacusai] proxy listening on http://${PROXY_HOST}:${proxyPort}`);
-      resolve();
-    });
-    proxyServer.on("error", (err: NodeJS.ErrnoException) => {
-      reject(err);
-    });
+
+    // Try fixed port first, then retry with port+1, +2, etc.
+    const tryListen = (port: number, attempt: number) => {
+      proxyServer!.listen(port, PROXY_HOST, () => {
+        proxyPort = port;
+        console.log(`[abacusai] proxy listening on http://${PROXY_HOST}:${proxyPort}`);
+        resolve();
+      });
+      proxyServer!.once("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "EADDRINUSE" && attempt < 10) {
+          console.log(`[abacusai] port ${port} in use, trying ${port + 1}...`);
+          proxyServer!.removeAllListeners("error");
+          proxyServer!.close(() => {
+            proxyServer = createServer((req, res) => {
+              handleProxyRequest(req, res).catch((e) => {
+                console.error("[abacusai] proxy error:", e);
+                sendJsonResponse(res, 500, { error: { message: String(e) } });
+              });
+            });
+            tryListen(port + 1, attempt + 1);
+          });
+        } else {
+          reject(err);
+        }
+      });
+    };
+
+    tryListen(PROXY_PORT_DEFAULT, 0);
   });
 }
 
@@ -742,7 +768,9 @@ function updateBaseUrlInConfig(): void {
     const configPath = join(stateDir, "openclaw.json");
     if (!existsSync(configPath)) return;
 
-    const raw = readFileSync(configPath, "utf-8");
+    let raw = readFileSync(configPath, "utf-8");
+    // Strip UTF-8 BOM if present
+    if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
     const config = JSON.parse(raw);
     const currentUrl = config?.models?.providers?.abacusai?.baseUrl;
 
@@ -783,7 +811,7 @@ interface PluginAuthContext {
 }
 
 const abacusaiPlugin = {
-  id: "abacusai-auth",
+  id: "openclaw-abacusai-auth",
   name: "AbacusAI Auth",
   description: "AbacusAI RouteLLM provider plugin with direct connection and schema normalization",
   configSchema: emptyPluginConfigSchema(),
@@ -934,7 +962,7 @@ const abacusaiPlugin = {
                         // and adding `additionalProperties: false`
                         baseUrl: `http://${PROXY_HOST}:${proxyPort}`,
                         api: "openai-completions",
-                        auth: "token",
+                        apiKey: "abacusai-proxy",
                         models: modelIds.map((id) => buildModelDefinition(id)),
                       },
                     },
@@ -965,3 +993,4 @@ const abacusaiPlugin = {
 };
 
 export default abacusaiPlugin;
+
