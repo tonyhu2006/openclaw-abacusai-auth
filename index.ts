@@ -1,4 +1,4 @@
-﻿import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync, appendFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -480,6 +480,8 @@ function normalizeMessagesForRouteLLM(messages: unknown[]): unknown[] {
   return messages.map((msg) => {
     if (!msg || typeof msg !== "object") return msg;
     const m = msg as Record<string, unknown>;
+
+    // Handle assistant tool calls
     if (m.role !== "assistant" || !Array.isArray(m.tool_calls)) return msg;
 
     const normalized = { ...m };
@@ -508,6 +510,94 @@ function normalizeMessagesForRouteLLM(messages: unknown[]): unknown[] {
     });
     return normalized;
   });
+}
+
+/**
+ * Flatten multi-turn conversation history for OpenAI models routed via RouteLLM.
+ *
+ * ROOT CAUSE:  RouteLLM internally converts Chat Completions → OpenAI Responses
+ * API for newer OpenAI models (GPT-4o, GPT-5, o-series, etc.).  Its converter
+ * incorrectly maps ALL message content blocks to `type: "input_text"`, but
+ * OpenAI's Responses API requires `type: "output_text"` for assistant/model
+ * output messages.  This causes HTTP 400 on ANY multi-turn conversation.
+ *
+ * WORKAROUND:  Embed the entire conversation history as plain text inside the
+ * system prompt, so the final payload contains ONLY `system` + `user` messages.
+ * With no `role: "assistant"` messages, RouteLLM's converter never produces the
+ * invalid `output_text` blocks.  The model's current-turn tool definitions
+ * remain intact.
+ *
+ * This is only applied to OpenAI models; other providers (Claude, Gemini, etc.)
+ * pass through unchanged.
+ */
+function flattenHistoryForOpenAIModels(messages: unknown[], model: string): unknown[] {
+  // Only apply to OpenAI models that hit the Responses API path in RouteLLM
+  const isOpenAIModel = /^(gpt-|o1-|o3-|o4-|chatgpt-)/i.test(model);
+  if (!isOpenAIModel) return messages;
+
+  const msgs = messages as Array<Record<string, unknown>>;
+
+  // Separate system messages from conversation
+  const systemMsgs = msgs.filter((m) => m.role === "system");
+  const convMsgs = msgs.filter((m) => m.role !== "system");
+
+  // If there are no assistant messages, nothing to flatten
+  const hasAssistant = convMsgs.some((m) => m.role === "assistant");
+  if (!hasAssistant) return messages;
+
+  // Find the LAST user message – this becomes the sole user message
+  let lastUserIdx = -1;
+  for (let i = convMsgs.length - 1; i >= 0; i--) {
+    if (convMsgs[i].role === "user") {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  if (lastUserIdx < 0) return messages; // No user message, pass through
+
+  // Build textual history from all messages BEFORE the last user message
+  const historyParts: string[] = [];
+  for (let i = 0; i < lastUserIdx; i++) {
+    const m = convMsgs[i];
+    const role = m.role === "assistant" ? "Assistant" : m.role === "tool" ? "Tool-Result" : "User";
+    let content: string;
+    if (typeof m.content === "string") {
+      content = m.content;
+    } else if (m.content) {
+      content = JSON.stringify(m.content);
+    } else if (Array.isArray(m.tool_calls)) {
+      const calls = (m.tool_calls as Array<Record<string, unknown>>).map((tc) => {
+        const fn = tc.function as Record<string, unknown> | undefined;
+        return fn ? `${fn.name}(${fn.arguments || "{}"})` : JSON.stringify(tc);
+      });
+      content = `[Called tools: ${calls.join(", ")}]`;
+    } else {
+      content = "(empty)";
+    }
+    // Truncate very long messages
+    if (content.length > 3000) {
+      content = content.slice(0, 3000) + "... [truncated]";
+    }
+    historyParts.push(`${role}: ${content}`);
+  }
+
+  // Build the flattened system prompt
+  const originalSystem = systemMsgs.map((m) =>
+    typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")
+  ).join("\n\n");
+
+  const historyBlock = historyParts.length > 0
+    ? "\n\n<conversation_history>\n" + historyParts.join("\n\n") + "\n</conversation_history>"
+    : "";
+
+  const lastUserContent = typeof convMsgs[lastUserIdx].content === "string"
+    ? convMsgs[lastUserIdx].content as string
+    : JSON.stringify(convMsgs[lastUserIdx].content ?? "");
+
+  return [
+    { role: "system", content: originalSystem + historyBlock },
+    { role: "user", content: lastUserContent },
+  ];
 }
 
 /**
@@ -581,12 +671,53 @@ async function handleProxyRequestInner(req: IncomingMessage, res: ServerResponse
     return;
   }
 
-  const target = `${ROUTELLM_BASE}${path}`;
+  let targetPath = path === "/" ? "" : path;
+  if (targetPath.startsWith("/v1/")) {
+    targetPath = targetPath.slice(3); // e.g., "/v1/models" -> "/models"
+  }
+
   const headers: Record<string, string> = {
     Authorization: `Bearer ${proxyApiKey}`,
     "Content-Type": "application/json",
   };
 
+  // Intercept /models requests to return standard OpenAI format
+  if (targetPath === "/models") {
+    try {
+      const { response: upstream, release } = await fetchWithSsrFGuard({
+        url: `${ROUTELLM_BASE}/models`,
+        init: { method: "GET", headers },
+        timeoutMs: 30_000,
+      });
+      const data = await upstream.text();
+      await release();
+
+      let json;
+      try {
+        json = JSON.parse(data);
+      } catch (e) {
+        sendJsonResponse(res, 500, { error: { message: "Invalid JSON from RouteLLM /models" } });
+        return;
+      }
+
+      // Ensure it has { object: "list", data: [...] } where each model has { object: "model" }
+      const models = Array.isArray(json?.data) ? json.data : Array.isArray(json) ? json : [];
+      const normalizedModels = models.map((m: any) => ({
+        ...m,
+        object: "model"
+      }));
+
+      sendJsonResponse(res, 200, {
+        object: "list",
+        data: normalizedModels
+      });
+    } catch (err: any) {
+      sendJsonResponse(res, 500, { error: { message: `Failed to fetch models: ${err.message}` } });
+    }
+    return;
+  }
+
+   const target = `${ROUTELLM_BASE}${targetPath}`;
   let body: string | undefined;
   if (req.method === "POST") {
     const raw = await readBody(req);
@@ -594,13 +725,33 @@ async function handleProxyRequestInner(req: IncomingMessage, res: ServerResponse
     // Normalize tools for RouteLLM: remove `strict` field, clean schemas
     // (remove patternProperties, add additionalProperties: false, etc.)
 
+    // Log the request for debugging
+    try {
+      const logEntry = `[${new Date().toISOString()}] ${req.method} ${targetPath} model=${parsed.model || "?"}\n`;
+      appendFileSync("C:/tmp/proxy-requests.log", logEntry);
+    } catch (e) { /* ignore */ }
 
     if (Array.isArray(parsed.tools)) {
       parsed.tools = normalizeToolsForRouteLLM(parsed.tools);
     }
     // Normalize tool_calls in messages: add top-level name/parameters for RouteLLM
     if (Array.isArray(parsed.messages)) {
+      // Log message roles BEFORE transformation
+      const rolesBefore = (parsed.messages as any[]).map((m: any) => m?.role || "?").join(",");
+      
       parsed.messages = normalizeMessagesForRouteLLM(parsed.messages);
+      // Flatten conversation history for OpenAI models to work around
+      // RouteLLM's buggy Chat Completions → Responses API converter
+      const modelName = typeof parsed.model === "string" ? parsed.model : "";
+      parsed.messages = flattenHistoryForOpenAIModels(parsed.messages as unknown[], modelName);
+      
+      // Log message roles AFTER transformation
+      const rolesAfter = (parsed.messages as any[]).map((m: any) => m?.role || "?").join(",");
+      const hasAssistant = (parsed.messages as any[]).some((m: any) => m?.role === "assistant");
+      try {
+        appendFileSync("C:/tmp/proxy-requests.log",
+          `  BEFORE: ${rolesBefore}\n  AFTER:  ${rolesAfter}\n  hasAssistant=${hasAssistant} model=${modelName}\n`);
+      } catch (e) { /* ignore */ }
     }
     body = JSON.stringify(parsed);
   }
@@ -882,7 +1033,85 @@ function updateBaseUrlInConfig(pluginApi: any): void {
 }
 
 // ---------------------------------------------------------------------------
-// Plugin
+// Dynamic Model Updater
+// ---------------------------------------------------------------------------
+
+async function updateRouteLlmModels(pluginApi: any): Promise<string> {
+  try {
+    const res = await fetch("https://routellm.abacus.ai/v1/models");
+    if (!res.ok) {
+      throw new Error(`HTTP error! status: ${res.status}`);
+    }
+    const data = await res.json();
+    if (!data.data || !Array.isArray(data.data)) {
+      throw new Error("Invalid response format from RouteLLM");
+    }
+
+    const fetchedModelIds = data.data.map((m: any) => m.id);
+    const newModels = fetchedModelIds.map(buildModelDefinition);
+
+    // 1. Update in-memory configuration
+    if (pluginApi.config?.models?.providers?.abacusai) {
+      pluginApi.config.models.providers.abacusai.models = newModels;
+    }
+
+    // 2. Persist to openclaw.json
+    const stateDir = process.env.OPENCLAW_STATE_DIR || join(homedir(), ".openclaw");
+    const configPath = join(stateDir, "openclaw.json");
+    if (existsSync(configPath)) {
+      const configStr = readFileSync(configPath, "utf8");
+      const configObj = JSON.parse(configStr);
+      let updatedConfig = false;
+
+      if (configObj.models?.providers?.abacusai) {
+        configObj.models.providers.abacusai.models = newModels;
+        updatedConfig = true;
+      }
+
+      // Sync with agents.defaults.models so they appear in chat dropdown immediately
+      if (configObj.agents?.defaults) {
+        if (!configObj.agents.defaults.models) {
+          configObj.agents.defaults.models = {};
+        }
+
+        const prefixedFetchedIds = fetchedModelIds.map((id: string) => `abacusai/${id}`);
+
+        // 2a. Purge outdated models
+        const existingAgentModels = Object.keys(configObj.agents.defaults.models);
+        for (const modelId of existingAgentModels) {
+          if (modelId.startsWith("abacusai/") && !prefixedFetchedIds.includes(modelId)) {
+            delete configObj.agents.defaults.models[modelId];
+            updatedConfig = true;
+          }
+        }
+
+        // 2b. Add new models
+        for (const modelId of prefixedFetchedIds) {
+          if (!configObj.agents.defaults.models[modelId]) {
+            configObj.agents.defaults.models[modelId] = {};
+            updatedConfig = true;
+          }
+        }
+      }
+
+      if (updatedConfig) {
+        writeFileSync(configPath, JSON.stringify(configObj, null, 2), "utf8");
+
+        // Tell OpenClaw to hot-reload the configuration so the model list reflects in the UI 
+        if (typeof (pluginApi as any).reloadConfig === "function") {
+          (pluginApi as any).reloadConfig();
+        }
+      }
+    }
+    return `✅ Successfully fetched and updated ${newModels.length} models from AbacusAI RouteLLM.`;
+  } catch (err: any) {
+    console.error("[abacusai] Failed to update models:", err);
+    return `❌ Failed to update models: ${err.message}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin Entry Point
 // ---------------------------------------------------------------------------
 
 // Type definitions for plugin API
@@ -913,22 +1142,68 @@ const abacusaiPlugin = {
       config?: {
         models?: { providers?: { abacusai?: { compat?: { supportsStrictMode?: boolean } } } };
       };
+      registerCommand?: (command: { name: string; description: string; handler: Function; execute?: Function }) => void;
     };
 
     // ================================================================
     // Register gateway_stop hook for graceful proxy shutdown
     // ================================================================
     if (typeof pluginApi.registerHook === "function") {
-      pluginApi.registerHook(
-        "gateway_stop",
-        async () => {
-          await stopProxy();
-        },
-        { name: "openclaw-abacusai-auth:gateway-stop" },
-      );
+      pluginApi.registerHook("gateway_stop", async () => {
+        console.log("[abacusai] gateway_stop hook triggered, stopping proxy gracefully...");
+        await stopProxy();
+      });
     }
 
-    // Fallback: handle process signals if gateway_stop hook is unavailable
+    // ================================================================
+    // Register chat command for updating models
+    // ================================================================
+    if (typeof pluginApi.registerCommand === "function") {
+      try {
+        pluginApi.registerCommand({
+          name: "abacusai",
+          description: "AbacusAI utilities (e.g. /abacusai pull-models)",
+          // OpenClaw SDK typically accepts a handler function for the command
+          handler: async (ctx: any) => {
+            // Fallback string matching to capture args
+            const contentStr = (ctx?.content || "").trim();
+            const argsStr = ctx?.args ? ctx.args.join(" ") : contentStr;
+            const isPull = argsStr === "pull-models" || argsStr === "" || argsStr.includes("pull-models");
+
+            // Dump api keys for debugging
+            try {
+              writeFileSync("C:/tmp/api-keys.txt", Object.keys(pluginApi).join(", "), "utf8");
+            } catch (e) { }
+
+            if (isPull) {
+              const res = await updateRouteLlmModels(pluginApi);
+              try { appendFileSync("C:/tmp/abacus-update.log", res + "\n"); } catch (e) { }
+              return { text: res };
+            }
+            return { text: `Unknown subcommand: ${argsStr}. Usage: /abacusai pull-models` };
+          },
+          // Just in case it's named 'execute' or 'run' in different SDK versions
+          execute: async (ctx: any) => {
+            const contentStr = (ctx?.content || "").trim();
+            const argsStr = ctx?.args ? ctx.args.join(" ") : contentStr;
+            const isPull = argsStr === "pull-models" || argsStr === "" || argsStr.includes("pull-models");
+
+            if (isPull) {
+              const res = await updateRouteLlmModels(pluginApi);
+              try { appendFileSync("C:/tmp/abacus-update.log", res + "\n"); } catch (e) { }
+              return { text: res };
+            }
+            return { text: `Unknown subcommand: ${argsStr}. Usage: /abacusai pull-models` };
+          }
+        });
+      } catch (e) {
+        console.error("[abacusai] Error registering command:", e);
+      }
+    }
+
+    // ================================================================
+    // Process signal handlers for fallback proxy shutdown
+    // ================================================================
     const shutdownHandler = () => {
       stopProxy().then(() => process.exit(0));
     };
